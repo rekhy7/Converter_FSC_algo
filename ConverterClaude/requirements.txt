@@ -1,0 +1,17 @@
+# Film Negative Converter v2 - Dependencies
+
+# Core processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# RAW file handling
+rawpy>=0.18.0
+
+# Color science
+colour-science>=0.4.0  # For Rec.2020 and color space conversions
+
+# GUI (Phase 2)
+PyQt6>=6.5.0
+
+# Optional: Performance
+# numba>=0.57.0  # Uncomment for JIT optimization
