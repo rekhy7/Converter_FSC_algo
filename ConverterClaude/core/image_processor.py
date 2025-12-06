@@ -4,6 +4,7 @@ Image processor orchestrating the conversion pipeline.
 
 import numpy as np
 from typing import Optional
+import cv2
 
 from .raw_loader import load_raw_linear, get_raw_info, RawLoadError
 from .white_balance import (

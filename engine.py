@@ -88,6 +88,13 @@ class Engine:
 
     # ---------- Public API ----------
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "base_preview_np") and self.base_preview_np is not None:
+            # Anzeige neu zeichnen
+            self._refresh_tone_preview()
+
+
     def _make_negative_preview(self) -> QImage:
         """
         Aus dem aktuellen Negativ (ImageProcessor) eine sRGB-Preview (QImage)

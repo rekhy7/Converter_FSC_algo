@@ -22,216 +22,279 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QAction, QPixmap, QImage, QTransform
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QRect, QSize, QTimer
 
-
 from core.adjustments import apply_all_adjustments, apply_detail_np
 from core.fsc_tone import apply_fsc_tone
 
 from engine import Engine
 
-class ImageLabel(QLabel):
+class ImageLabel(QtWidgets.QLabel):
+    """
+    Bildanzeige mit Crop-Overlay:
+    - setCropMode(True/False)
+    - setInitialCropRect(QRect)
+    - getCropRect() -> QRect | None
+    """
     clickedAt = pyqtSignal(QPoint)
     selectionMade = pyqtSignal(QRect)
 
+    HANDLE_RADIUS = 6
+    MIN_SIZE = 20
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.crop_mode = False
-        self._crop_rect: QRect | None = None
-        self._drag_mode: str | None = None
-        self._drag_start_pos: QPoint | None = None
-        self._drag_start_rect: QRect | None = None
-        self.aspect_ratio: float | None = None  # width / height
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setBackgroundRole(QtGui.QPalette.ColorRole.Dark)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        self.setScaledContents(False)
 
-    # --- API vom MainWindow ---
+        # Crop-Status
+        self._crop_enabled: bool = False
+        self._crop_rect: QtCore.QRect | None = None
+
+        # Drag-Status
+        self._drag_mode: str | None = None  # "move" | "resize" | None
+        self._drag_handle: int | None = None  # 0..7
+        self._drag_start_pos: QtCore.QPoint | None = None
+        self._drag_start_rect: QtCore.QRect | None = None
+
+    # -------------------------------------------------- API
 
     def setCropMode(self, enabled: bool) -> None:
-        self.crop_mode = enabled
+        self._crop_enabled = bool(enabled)
         if not enabled:
             self._drag_mode = None
-            self._drag_start_pos = None
-            self._drag_start_rect = None
+            self._drag_handle = None
         self.update()
 
-    def setInitialCropRect(self, rect: QRect) -> None:
-        self._crop_rect = QRect(rect)
+    def setInitialCropRect(self, rect: QtCore.QRect) -> None:
+        if rect is None:
+            self._crop_rect = None
+        else:
+            self._crop_rect = QtCore.QRect(rect)
         self.update()
 
-    def setAspectRatio(self, ratio: float | None) -> None:
-        self.aspect_ratio = ratio
-
-    # --- interne Helfer ---
-
-    def _hit_test(self, pos: QPoint) -> str | None:
+    def getCropRect(self) -> QtCore.QRect | None:
         if self._crop_rect is None:
             return None
-        r = self._crop_rect
-        margin = 10
-        x, y, w, h = r.x(), r.y(), r.width(), r.height()
-        left, right, top, bottom = x, x + w, y, y + h
-        px, py = pos.x(), pos.y()
+        return QtCore.QRect(self._crop_rect)
 
-        if abs(px - left) <= margin and abs(py - top) <= margin:
-            return "tl"
-        if abs(px - right) <= margin and abs(py - top) <= margin:
-            return "tr"
-        if abs(px - left) <= margin and abs(py - bottom) <= margin:
-            return "bl"
-        if abs(px - right) <= margin and abs(py - bottom) <= margin:
-            return "br"
-        if (left + margin <= px <= right - margin) and (
-            top + margin <= py <= bottom - margin
-        ):
-            return "move"
+    # -------------------------------------------------- intern: Handle-Positionen
+
+    def _handle_points(self) -> list[QtCore.QPoint]:
+        """
+        8 Handle-Punkte in Label-Koordinaten:
+        0: TL, 1: TM, 2: TR, 3: MR, 4: BR, 5: BM, 6: BL, 7: ML
+        """
+        pts: list[QtCore.QPoint] = []
+        if self._crop_rect is None:
+            return pts
+
+        r = self._crop_rect
+        cx = r.center().x()
+        cy = r.center().y()
+
+        pts.append(QtCore.QPoint(r.left(), r.top()))          # TL
+        pts.append(QtCore.QPoint(cx, r.top()))                # TM
+        pts.append(QtCore.QPoint(r.right(), r.top()))         # TR
+        pts.append(QtCore.QPoint(r.right(), cy))              # MR
+        pts.append(QtCore.QPoint(r.right(), r.bottom()))      # BR
+        pts.append(QtCore.QPoint(cx, r.bottom()))             # BM
+        pts.append(QtCore.QPoint(r.left(), r.bottom()))       # BL
+        pts.append(QtCore.QPoint(r.left(), cy))               # ML
+        return pts
+
+    def _hit_test_handle(self, pos: QtCore.QPoint) -> int | None:
+        if self._crop_rect is None:
+            return None
+        for idx, pt in enumerate(self._handle_points()):
+            if (pt - pos).manhattanLength() <= self.HANDLE_RADIUS + 2:
+                return idx
         return None
 
-    def _make_aspect_rect(self, fixed: QPoint, current: QPoint) -> QRect:
-        """
-        Erzeugt ein Rechteck mit dem gewünschten Seitenverhältnis.
-        Orientation (hoch/quer) richtet sich nach der Zugrichtung:
-        - mehr horizontal -> landscape
-        - mehr vertikal   -> portrait
-        """
-        if self.aspect_ratio is None or self.aspect_ratio <= 0:
-            return QRect(fixed, current).normalized()
+    def _cursor_for_handle(self, idx: int) -> QtGui.QCursor:
+        # einfache Version, keine perfekte Winkel-Logik
+        if idx in (0, 4):   # TL / BR
+            return QtGui.QCursor(Qt.CursorShape.SizeFDiagCursor)
+        if idx in (2, 6):   # TR / BL
+            return QtGui.QCursor(Qt.CursorShape.SizeBDiagCursor)
+        if idx in (1, 5):   # TM / BM
+            return QtGui.QCursor(Qt.CursorShape.SizeVerCursor)
+        if idx in (3, 7):   # MR / ML
+            return QtGui.QCursor(Qt.CursorShape.SizeHorCursor)
+        return QtGui.QCursor(Qt.CursorShape.ArrowCursor)
 
-        ax = float(self.aspect_ratio)  # width / height
+    # -------------------------------------------------- Events
 
-        fx, fy = fixed.x(), fixed.y()
-        cx, cy = current.x(), current.y()
-        dx, dy = cx - fx, cy - fy
+    def mousePressEvent(self, ev: QtGui.QMouseEvent) -> None:
+        # Wenn kein Crop-Modus aktiv ist: Klick an MainWindow weitergeben
+        if not self._crop_enabled:
+            if ev.button() == Qt.MouseButton.LeftButton:
+                self.clickedAt.emit(ev.position().toPoint())
+            return super().mousePressEvent(ev)
 
-        # Wenn horizontaler Zug stärker ist -> Breite führt
-        if abs(dx) >= abs(dy):
-            width = max(1, abs(dx))
-            height = max(1, int(round(width / ax)))
-        else:
-            # Vertikaler Zug stärker -> Höhe führt (Portrait)
-            height = max(1, abs(dy))
-            width = max(1, int(round(height * ax)))
+        # Ab hier: Crop-Modus aktiv
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(ev)
 
-        # Rechteck in Zugrichtung wachsen lassen
-        x0 = fx if dx >= 0 else fx - width
-        x1 = fx + width if dx >= 0 else fx
-        y0 = fy if dy >= 0 else fy - height
-        y1 = fy + height if dy >= 0 else fy
-
-        return QRect(QPoint(x0, y0), QPoint(x1, y1)).normalized()
-
-    # --- Events ---
-
-    def mousePressEvent(self, event):
-        if not self.crop_mode:
-            # Normalbetrieb: Klick für WB etc.
-            self.clickedAt.emit(event.position().toPoint())
+        if self._crop_rect is None:
+            # Neues Rechteck beginnen
+            pos = ev.position().toPoint()
+            self._crop_rect = QtCore.QRect(pos, pos)
+            self._drag_mode = "resize"
+            self._drag_handle = 4  # BR
+            self._drag_start_pos = pos
+            self._drag_start_rect = QtCore.QRect(self._crop_rect)
+            self.setCursor(self._cursor_for_handle(4))
+            self.update()
             return
 
-        pos = event.position().toPoint()
+        pos = ev.position().toPoint()
         self._drag_start_pos = pos
+        self._drag_start_rect = QtCore.QRect(self._crop_rect)
 
-        if self._crop_rect is not None and self._crop_rect.contains(pos):
-            handle = self._hit_test(pos)
-            if handle in ("tl", "tr", "bl", "br"):
-                self._drag_mode = handle
-                self._drag_start_rect = QRect(self._crop_rect)
-            elif handle == "move":
-                self._drag_mode = "move"
-                self._drag_start_rect = QRect(self._crop_rect)
-            else:
-                # in Rect, aber kein Handle -> Move
-                self._drag_mode = "move"
-                self._drag_start_rect = QRect(self._crop_rect)
+        handle = self._hit_test_handle(pos)
+        if handle is not None:
+            self._drag_mode = "resize"
+            self._drag_handle = handle
+            self.setCursor(self._cursor_for_handle(handle))
+        elif self._crop_rect.contains(pos):
+            self._drag_mode = "move"
+            self._drag_handle = None
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
         else:
-            # neues Rechteck starten
-            self._drag_mode = "new"
-            self._drag_start_rect = None
-            self._crop_rect = QRect(pos, QSize(1, 1))
+            # Klick außerhalb -> neues Rechteck aufziehen
+            self._drag_mode = "resize"
+            self._drag_handle = 4  # BR
+            self._crop_rect = QtCore.QRect(pos, pos)
+            self._drag_start_rect = QtCore.QRect(self._crop_rect)
+            self.setCursor(self._cursor_for_handle(4))
 
         self.update()
 
-    def mouseMoveEvent(self, event):
-        if not self.crop_mode or self._drag_mode is None:
-            return
 
-        pos = event.position().toPoint()
+    def mouseMoveEvent(self, ev: QtGui.QMouseEvent) -> None:
+        pos = ev.position().toPoint()
 
-        if self._drag_mode == "new" and self._drag_start_pos is not None:
-            if self.aspect_ratio:
-                r = self._make_aspect_rect(self._drag_start_pos, pos)
+        if self._crop_enabled and self._drag_mode is None and self._crop_rect is not None:
+            # nur Hover: Cursor ändern
+            handle = self._hit_test_handle(pos)
+            if handle is not None:
+                self.setCursor(self._cursor_for_handle(handle))
+            elif self._crop_rect.contains(pos):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
-                r = QRect(self._drag_start_pos, pos).normalized()
-        elif (
-            self._drag_mode == "move"
-            and self._drag_start_rect is not None
-            and self._drag_start_pos is not None
-        ):
-            dx = pos.x() - self._drag_start_pos.x()
-            dy = pos.y() - self._drag_start_pos.y()
-            r = QRect(self._drag_start_rect)
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if not self._crop_enabled or self._crop_rect is None or self._drag_mode is None:
+            return super().mouseMoveEvent(ev)
+
+        assert self._drag_start_pos is not None
+        assert self._drag_start_rect is not None
+
+        dx = pos.x() - self._drag_start_pos.x()
+        dy = pos.y() - self._drag_start_pos.y()
+        r = QtCore.QRect(self._drag_start_rect)
+
+        if self._drag_mode == "move":
             r.translate(dx, dy)
-        elif (
-            self._drag_mode in ("tl", "tr", "bl", "br")
-            and self._drag_start_rect is not None
-        ):
-            fixed = {
-                "tl": self._drag_start_rect.bottomRight(),
-                "tr": self._drag_start_rect.bottomLeft(),
-                "bl": self._drag_start_rect.topRight(),
-                "br": self._drag_start_rect.topLeft(),
-            }[self._drag_mode]
-            if self.aspect_ratio:
-                r = self._make_aspect_rect(fixed, pos)
-            else:
-                r = QRect(fixed, pos).normalized()
-        else:
-            return
+            # innerhalb des Labels begrenzen
+            r.moveLeft(max(0, min(self.width() - r.width(), r.left())))
+            r.moveTop(max(0, min(self.height() - r.height(), r.top())))
+        elif self._drag_mode == "resize":
+            idx = self._drag_handle
+            if idx is None:
+                return
 
-        self._crop_rect = r
+            # je nach Handle Seiten verschieben
+            if idx in (0, 6, 7):  # links betroffen
+                new_left = r.left() + dx
+                new_left = max(0, min(new_left, r.right() - self.MIN_SIZE))
+                r.setLeft(new_left)
+            if idx in (2, 3, 4):  # rechts betroffen
+                new_right = r.right() + dx
+                new_right = min(self.width() - 1, max(new_right, r.left() + self.MIN_SIZE))
+                r.setRight(new_right)
+            if idx in (0, 1, 2):  # oben betroffen
+                new_top = r.top() + dy
+                new_top = max(0, min(new_top, r.bottom() - self.MIN_SIZE))
+                r.setTop(new_top)
+            if idx in (4, 5, 6):  # unten betroffen
+                new_bottom = r.bottom() + dy
+                new_bottom = min(self.height() - 1, max(new_bottom, r.top() + self.MIN_SIZE))
+                r.setBottom(new_bottom)
+
+        self._crop_rect = r.normalized()
         self.update()
 
-    def mouseReleaseEvent(self, event):
-        if self.crop_mode and self._crop_rect is not None:
-            self.selectionMade.emit(QRect(self._crop_rect))
-        self._drag_mode = None
-        self._drag_start_pos = None
-        self._drag_start_rect = None
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent) -> None:
+        if self._crop_enabled and ev.button() == Qt.MouseButton.LeftButton:
+            # Bei loslassen im Crop-Modus das finale Rect melden
+            if self._crop_rect is not None:
+                self.selectionMade.emit(QtCore.QRect(self._crop_rect))
+            self._drag_mode = None
+            self._drag_handle = None
+            self._drag_start_pos = None
+            self._drag_start_rect = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.crop_mode or self._crop_rect is None:
+        return super().mouseReleaseEvent(ev)
+
+
+    def leaveEvent(self, ev: QtCore.QEvent) -> None:
+        if not self._crop_enabled or self._drag_mode is None:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        return super().leaveEvent(ev)
+
+    # -------------------------------------------------- Zeichnen
+
+    def paintEvent(self, ev: QtGui.QPaintEvent) -> None:
+        super().paintEvent(ev)
+
+        if not self._crop_enabled or self._crop_rect is None:
             return
 
-        from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QRegion
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
         r = self._crop_rect
-        full = self.rect()
 
-        # Außenbereich abdunkeln
-        overlay_color = QColor(0, 0, 0, 120)
-        outer = QRegion(full)
-        inner = QRegion(r)
-        painter.setClipRegion(outer.subtracted(inner))
-        painter.fillRect(full, overlay_color)
-        painter.setClipping(False)
+        # dunkle Maske außen herum
+        painter.save()
+        painter.setBrush(QtGui.QColor(0, 0, 0, 120))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+
+        outer = QtCore.QRectF(self.rect())
+        path = QtGui.QPainterPath()
+        path.addRect(outer)
+        inner = QtGui.QPainterPath()
+        inner.addRect(QtCore.QRectF(r))
+        path = path.subtracted(inner)
+        painter.drawPath(path)
+
+        painter.restore()
 
         # Rahmen
-        pen = QPen(Qt.GlobalColor.white)
-        pen.setWidth(1)
+        pen = QtGui.QPen(QtGui.QColor(80, 160, 255), 2)
         painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         painter.drawRect(r)
 
-        # Griffe
-        handle_size = 8
-        half = handle_size // 2
-        corners = [r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()]
-        brush = QBrush(Qt.GlobalColor.white)
-        painter.setBrush(brush)
-        for c in corners:
-            cx, cy = c.x(), c.y()
-            handle_rect = QRect(cx - half, cy - half, handle_size, handle_size)
-            painter.drawRect(handle_rect)
+        # 8 Handles
+        painter.setBrush(QtGui.QColor(80, 160, 255))
+        painter.setPen(QtGui.QPen(QtGui.QColor(20, 60, 120), 1))
+
+        for pt in self._handle_points():
+            painter.drawEllipse(
+                pt,
+                self.HANDLE_RADIUS,
+                self.HANDLE_RADIUS,
+            )
+
+        painter.end()
+
 
 class ResetSlider(QtWidgets.QSlider):
     def __init__(self, orientation, default_value=0, parent=None):
@@ -243,8 +306,6 @@ class ResetSlider(QtWidgets.QSlider):
         self.setValue(self._default_value)
         self.valueChanged.emit(self._default_value)
         super().mouseDoubleClickEvent(event)
-
-from PyQt6 import QtCore, QtWidgets
 
 class TonePanel(QtWidgets.QWidget):
     gammaChanged = QtCore.pyqtSignal(float)
@@ -620,6 +681,21 @@ class MainWindow(QMainWindow):
         self.engine.preview_max_dim = 1200  # statt fix 1200
         # Basis-Preview (skalierte Positiv-Vorschau), auf die Tone-Slider wirken
         self.base_preview_np: np.ndarray | None = None
+        self._crop_preview_scale: float = 1.0
+
+        # Mapping von Bild -> Label (für Crop)
+        self._view_scale: float | None = None
+        self._view_offset_x: int = 0
+        self._view_offset_y: int = 0
+        self._view_img_size: tuple[int, int] | None = None  # (W, H)
+        self.crop_mode: bool = False
+
+
+        # Geometrie-Status für das Arbeitsbild (Preview)
+        self.geom_orientation = 0  # 0,1,2,3 -> 0°, 90°, 180°, 270°
+        self.geom_mirror_h = False
+        self.geom_mirror_v = False
+
 
         # Tone / Color UI state (für Preview-Slider)
         self.ui_exposure = 0.0
@@ -657,7 +733,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.image_label)
 
         self.setCentralWidget(central)
-
         # Timer für "refit nach Resize", damit das Bild nicht bei jedem Pixel verschmiert
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -686,18 +761,32 @@ class MainWindow(QMainWindow):
         self.act_convert.triggered.connect(self.on_convert)
         toolbar.addAction(self.act_convert)
 
+        # Crop & Rotate
+        self.act_crop = QAction("Crop", self)
+        self.act_crop.setCheckable(True)
+        self.act_crop.toggled.connect(self.on_crop_toggled)
+        toolbar.addAction(self.act_crop)
+
+        self.act_rot_left = QAction("Rotate ⟲ 90°", self)
+        self.act_rot_left.triggered.connect(self.on_rotate_left)
+        toolbar.addAction(self.act_rot_left)
+
+        self.act_rot_right = QAction("Rotate ⟳ 90°", self)
+        self.act_rot_right.triggered.connect(self.on_rotate_right)
+        toolbar.addAction(self.act_rot_right)
 
         self.act_recalc = QAction("Recalculate", self)
         self.act_recalc.triggered.connect(self.on_recalculate)
         self.act_recalc.setEnabled(False)
         toolbar.addAction(self.act_recalc)
 
-
         # Export
         self.act_export = QAction("Export JPEG…", self)
         self.act_export.triggered.connect(self.on_export)
         self.act_export.setEnabled(False)
         toolbar.addAction(self.act_export)
+
+
 
 
         # Tone / Color Dock rechts andocken
@@ -707,14 +796,7 @@ class MainWindow(QMainWindow):
         self.tone_dock.setWidget(self.tone_panel)
         self.tone_dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
 
-        # Nur maximale Breite begrenzen, damit es im Vollbild nicht riesig wird
-        self.tone_dock.setMaximumWidth(420)  # Wert nach Gefühl anpassen (z.B. 400–450)
-
-        # Abdocken/Schließen deaktivieren (optional, wie gewünscht)
-        self.tone_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
-
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.tone_dock)
-
 
         # --- Thumbnails-Dock links (Platzhalter) ---
         self.thumb_panel = QWidget()
@@ -741,6 +823,16 @@ class MainWindow(QMainWindow):
         self.tone_panel.setEnabled(False)
 
 
+        # Nur maximale Breite begrenzen, damit es im Vollbild nicht riesig wird
+        self.tone_dock.setMaximumWidth(420)  # Wert nach Gefühl anpassen (z.B. 400–450)
+
+        # Abdocken/Schließen deaktivieren (optional, wie gewünscht)
+        self.tone_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.tone_dock)
+
+
+
         # erstmal deaktiviert, bis ein Positiv vorhanden ist
         self.tone_panel.setEnabled(False)
 
@@ -761,6 +853,7 @@ class MainWindow(QMainWindow):
         # Startzustand
         self.wb_mode = False
         self.act_convert.setEnabled(False)
+
         self.act_wb.toggled.connect(self.on_wb_toggled)
 
         # Startgröße
@@ -797,7 +890,6 @@ class MainWindow(QMainWindow):
         self.act_convert.setEnabled(True)
 
         self.statusBar().showMessage("RAW geladen. Optional WB vom Rand (WB-Button)", 5000)
-
 
     def on_wb_toggled(self, checked: bool) -> None:
         self.wb_mode = checked
@@ -901,7 +993,6 @@ class MainWindow(QMainWindow):
             self.act_export.setEnabled(True)
         if hasattr(self, "act_recalc"):
             self.act_recalc.setEnabled(True)
-
         if hasattr(self, "tone_panel"):
             self.tone_panel.setEnabled(True)
 
@@ -976,14 +1067,6 @@ class MainWindow(QMainWindow):
         self.base_preview_np = self._qimage_to_np(qimg)
         self._show_qimage(qimg)
 
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        super().resizeEvent(event)
-
-        # Bei jedem Resize den Timer neu starten – nur wenn der Nutzer
-        # kurz aufhört zu ziehen, wird wirklich neu gerendert.
-        if hasattr(self, "_resize_timer") and self._resize_timer is not None:
-            self._resize_timer.start(150)  # 150 ms kannst du nach Geschmack anpassen
-
     def _refit_image_to_view(self) -> None:
         """Bild passend in die aktuelle Bildmitte einpassen (nach Resize)."""
 
@@ -1001,6 +1084,199 @@ class MainWindow(QMainWindow):
         # 2) Vor Convert: RAW-Preview, falls vorhanden, neu einpassen
         if self._last_raw_qimage is not None:
             self._show_qimage(self._last_raw_qimage)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+
+        # Bei jedem Resize den Timer neu starten – nur wenn der Nutzer
+        # kurz aufhört zu ziehen, wird wirklich neu gerendert.
+        if hasattr(self, "_resize_timer") and self._resize_timer is not None:
+            self._resize_timer.start(150)  # 150 ms kannst du nach Geschmack anpassen
+
+
+
+    # --- Crop
+    def _enter_crop_mode(self) -> None:
+        """Switch ImageLabel into crop mode with full positive preview."""
+        if self.engine.pos_full_orig is None:
+            return
+
+        try:
+            qfull = self.engine.get_full_preview_for_crop()
+        except Exception as e:
+            print(f"Crop preview error: {e}")
+            return
+
+        # aktuelles Bild merken (für Cancel / Fehlerfall)
+        self.pixmap_before_crop = self.image_label.pixmap()
+
+        # Full-Preview auf die Größe des ImageLabels skalieren
+        target_w = self.image_label.width()
+        target_h = self.image_label.height()
+        if target_w > 0 and target_h > 0:
+            qdisp = qfull.scaled(
+                target_w,
+                target_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        else:
+            qdisp = qfull
+
+        self.image_label.setPixmap(QPixmap.fromImage(qdisp))
+
+        # Scale-Faktor von Full-Preview -> Label merken
+        if qfull.width() > 0 and qfull.height() > 0:
+            self._crop_preview_scale = qdisp.width() / qfull.width()
+        else:
+            self._crop_preview_scale = 1.0
+
+        # Initiales Crop-Rect: vorhandenes pos_crop_rect benutzen, falls vorhanden
+        init_rect = None
+        if (
+            self.engine.pos_crop_rect is not None
+            and self.engine.full_scale_x is not None
+            and self.engine.full_scale_y is not None
+        ):
+            x, y, w, h = self.engine.pos_crop_rect
+            # Original -> Full-Preview
+            x0_p = int(x * self.engine.full_scale_x)
+            y0_p = int(y * self.engine.full_scale_y)
+            x1_p = int((x + w) * self.engine.full_scale_x)
+            y1_p = int((y + h) * self.engine.full_scale_y)
+
+            # Full-Preview -> Label
+            s = self._crop_preview_scale
+            x0_l = int(x0_p * s + 0.5)
+            y0_l = int(y0_p * s + 0.5)
+            x1_l = int(x1_p * s + 0.5)
+            y1_l = int(y1_p * s + 0.5)
+
+            init_rect = QRect(
+                min(x0_l, x1_l),
+                min(y0_l, y1_l),
+                abs(x1_l - x0_l),
+                abs(y1_l - y0_l),
+            )
+
+        # Wenn kein vorheriger Crop: fast das ganze Bild nehmen
+        if init_rect is None:
+            r = self.image_label.rect()
+            margin = 20
+            init_rect = r.adjusted(margin, margin, -margin, -margin)
+
+        self.image_label.setInitialCropRect(init_rect)
+        self.image_label.setCropMode(True)
+
+    def _apply_crop_from_label(self) -> None:
+        """Read crop rect from ImageLabel and apply it to Engine."""
+        rect = self.image_label.getCropRect()
+        self.image_label.setCropMode(False)
+
+        # Kein Crop-Rechteck -> Vorschau zurücksetzen
+        if rect is None:
+            if self.pixmap_before_crop is not None:
+                self.image_label.setPixmap(self.pixmap_before_crop)
+            return
+
+        # Label-Koordinaten -> Full-Preview-Koordinaten
+        s = getattr(self, "_crop_preview_scale", 1.0)
+        x_p = int(rect.x() / s)
+        y_p = int(rect.y() / s)
+        w_p = int(rect.width() / s)
+        h_p = int(rect.height() / s)
+
+        try:
+            qimg = self.engine.apply_crop_from_full_preview_rect(x_p, y_p, w_p, h_p)
+        except Exception as e:
+            print(f"Apply crop error: {e}")
+            if self.pixmap_before_crop is not None:
+                self.image_label.setPixmap(self.pixmap_before_crop)
+            return
+
+        # Ab hier ist der neue Crop aktiv: Basis-Preview aktualisieren
+        self._set_base_preview_from_qimage(qimg)
+
+    @QtCore.pyqtSlot(bool)
+    def on_crop_toggled(self, checked: bool) -> None:
+        """Crop-Modus ein/aus."""
+        if checked:
+            if self.base_preview_np is None:
+                self.act_crop.setChecked(False)
+                return
+
+            self.crop_mode = True
+            # Einfach: fast das ganze Bild als Start-Rechteck
+            r = self.image_label.rect()
+            margin = 20
+            init_rect = r.adjusted(margin, margin, -margin, -margin)
+            self.image_label.setInitialCropRect(init_rect)
+            self.image_label.setCropMode(True)
+        else:
+            self._apply_crop_from_label()
+
+    def _apply_crop_from_label(self) -> None:
+        """Liest das Crop-Rechteck aus dem ImageLabel und cropt base_preview_np."""
+        self.crop_mode = False
+        self.image_label.setCropMode(False)
+
+        if self.base_preview_np is None:
+            self._refresh_tone_preview()
+            return
+
+        rect = self.image_label.getCropRect()
+        pix = self.image_label.pixmap()
+        if rect is None or pix is None:
+            self._refresh_tone_preview()
+            return
+
+        # Größen von Label und angezeigtem Pixmap
+        label_w = self.image_label.width()
+        label_h = self.image_label.height()
+        pix_w = pix.width()
+        pix_h = pix.height()
+
+        # Pixmap ist zentriert im Label
+        offset_x = max(0, (label_w - pix_w) // 2)
+        offset_y = max(0, (label_h - pix_h) // 2)
+
+        # Crop-Rechteck in "Pixmap-Koordinaten" umrechnen
+        x0_l = rect.x() - offset_x
+        y0_l = rect.y() - offset_y
+        x1_l = x0_l + rect.width()
+        y1_l = y0_l + rect.height()
+
+        # Auf den sichtbaren Bereich der Pixmap begrenzen
+        x0_l = max(0, min(pix_w - 1, x0_l))
+        y0_l = max(0, min(pix_h - 1, y0_l))
+        x1_l = max(0, min(pix_w, x1_l))
+        y1_l = max(0, min(pix_h, y1_l))
+
+        if x1_l <= x0_l + 2 or y1_l <= y0_l + 2:
+            self._refresh_tone_preview()
+            return
+
+        # Pixmap -> Arbeitsbild (base_preview_np)
+        H, W = self.base_preview_np.shape[:2]
+        s = min(pix_w / float(W), pix_h / float(H))
+        if s <= 0:
+            self._refresh_tone_preview()
+            return
+
+        x0 = int(round(x0_l / s))
+        y0 = int(round(y0_l / s))
+        x1 = int(round(x1_l / s))
+        y1 = int(round(y1_l / s))
+
+        # Auf Bildgrenzen begrenzen
+        x0 = max(0, min(W - 1, x0))
+        y0 = max(0, min(H - 1, y0))
+        x1 = max(x0 + 1, min(W, x1))
+        y1 = max(y0 + 1, min(H, y1))
+
+        # 👉 destruktiver Crop auf das Arbeitsbild
+        self.base_preview_np = self.base_preview_np[y0:y1, x0:x1].copy()
+        self._refresh_tone_preview()
 
 
     # ------ Slider pipeline
@@ -1315,6 +1591,25 @@ class MainWindow(QMainWindow):
     def on_sharpen_changed(self, v: float) -> None:
         self.ui_sharpen = float(v)
         self._refresh_tone_preview()
+
+
+
+    # ------- Rotate/Mirror ------
+    def on_rotate_left(self) -> None:
+        """Arbeitsbild 90° gegen den Uhrzeigersinn drehen."""
+        if self.base_preview_np is None:
+            return
+        self.base_preview_np = np.rot90(self.base_preview_np, k=1)
+        self._refresh_tone_preview()
+
+    def on_rotate_right(self) -> None:
+        """Arbeitsbild 90° im Uhrzeigersinn drehen."""
+        if self.base_preview_np is None:
+            return
+        self.base_preview_np = np.rot90(self.base_preview_np, k=-1)
+        self._refresh_tone_preview()
+
+
 
 
     #-----
